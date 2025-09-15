@@ -1,0 +1,2 @@
+# finexa
+ autonomous financial agent
