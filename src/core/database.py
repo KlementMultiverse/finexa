@@ -1,7 +1,7 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, Boolean, JSON, ForeignKey, TIMESTAMP
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, Boolean, JSON, ForeignKey, TIMESTAMP, and_, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 from .config import config
 
@@ -15,13 +15,13 @@ class FinexaTransaction(Base):
     amount = Column(Float, nullable=False)
     currency = Column(String(3), default='USD')
     merchant_name = Column(String, nullable=True)
-    document_type = Column(String(20), nullable=False)  # 'receipt' or 'statement_line'
+    document_type = Column(String(20), nullable=False)
     source_path = Column(String, nullable=False)
     raw_text = Column(String, nullable=False)
-    agent_schema = Column(JSON, nullable=False)  # Dynamic fields
+    agent_schema = Column(JSON, nullable=False)
     linked_id = Column(Integer, ForeignKey('mission_transactions.id'), nullable=True)
-    is_matched = Column(Boolean, default=False)  # Auto-calculated later
-    batch_id = Column(String, nullable=False)  # UUID as string
+    is_matched = Column(Boolean, default=False)
+    batch_id = Column(String, nullable=False)
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
     last_linked_at = Column(TIMESTAMP, nullable=True)
 
@@ -38,23 +38,38 @@ class FinexaDatabase:
         self.session.commit()
         return tx.id
     
-    def get_unlinked_transactions(self, date, amount, tolerance=0.05):
-        """Get candidates for linking"""
-        from sqlalchemy import and_, func
-        return self.session.query(FinexaTransaction).filter(
-            FinexaTransaction.id != kwargs.get('id'),
+    def get_transaction_by_id(self, tx_id: int):
+        return self.session.query(FinexaTransaction).filter_by(id=tx_id).first()
+    
+    def get_unlinked_transactions(self, date, amount, new_tx_id: int, batch_id: str, tolerance=0.05):
+        """Get candidates for linking — exclude self, prefer same batch."""
+        start_date = date - timedelta(days=3)
+        end_date = date + timedelta(days=3)
+        
+        # First, try same batch
+        candidates = self.session.query(FinexaTransaction).filter(
+            FinexaTransaction.id != new_tx_id,
             FinexaTransaction.linked_id.is_(None),
+            FinexaTransaction.batch_id == batch_id,  # ← SAME BATCH FIRST
             func.abs(FinexaTransaction.amount - amount) < amount * tolerance,
-            FinexaTransaction.transaction_date.between(
-                date.replace(day=1),  # Start of month
-                date.replace(day=28) + timedelta(days=4)  # End of month (approx)
-            )
+            FinexaTransaction.transaction_date.between(start_date, end_date)
         ).all()
+        
+        # If no same-batch candidates, try any batch
+        if not candidates:
+            candidates = self.session.query(FinexaTransaction).filter(
+                FinexaTransaction.id != new_tx_id,
+                FinexaTransaction.linked_id.is_(None),
+                func.abs(FinexaTransaction.amount - amount) < amount * tolerance,
+                FinexaTransaction.transaction_date.between(start_date, end_date)
+            ).all()
+        
+        return candidates
     
     def link_transactions(self, id1, id2):
-        """Link two transactions bidirectionally"""
-        tx1 = self.session.query(FinexaTransaction).filter_by(id=id1).first()
-        tx2 = self.session.query(FinexaTransaction).filter_by(id=id2).first()
+        """Link two transactions bidirectionally."""
+        tx1 = self.get_transaction_by_id(id1)
+        tx2 = self.get_transaction_by_id(id2)
         if tx1 and tx2:
             tx1.linked_id = id2
             tx2.linked_id = id1
