@@ -27,3 +27,26 @@ temp/
 # UI Build
 /dist
 /build
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+*.db
+*.sqlite3
+
+# Financial documents
+input/
+processed/
+*.pdf
+
+# Environment variables
+.env
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+temp_page.jpg
+*.tmp
