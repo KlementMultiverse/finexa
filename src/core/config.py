@@ -16,7 +16,7 @@ class Config:
     MODEL_PLUS = "qwen-plus"
     
     # Database
-    DB_URL = "sqlite:///finexa.db"  # We'll use SQLite for now
+    DB_PATH = "finexa.db"  # ← ADDED: File path for SQLite
     
     # Input/Output paths
     INPUT_DIR = "input"

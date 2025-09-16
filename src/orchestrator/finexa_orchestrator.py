@@ -1,5 +1,7 @@
 from typing import TypedDict, List, Annotated
 from langgraph.graph import StateGraph, END
+import sys
+sys.setrecursionlimit(10000)
 from src.core.config import config
 from src.core.database import FinexaDatabase
 from src.agents.file_scanner import FileScannerAgent
@@ -73,7 +75,6 @@ def generate_schema_node(state: AppState) -> dict:
 
 def store_transaction_node(state: AppState) -> dict:
     """Store transaction in DB."""
-    # Extract required fields from schema
     schema = state["agent_schema"]
     tx_id = storage.insert_transaction(
         transaction_date=schema.get("date", "2025-01-01"),
@@ -97,7 +98,7 @@ def link_transaction_node(state: AppState) -> dict:
 def move_file_node(state: AppState) -> dict:
     """Move processed file to /processed/."""
     mover.move_to_processed(state["current_pdf"])
-    print(f"📂 File moved: {state['current_pdf']}")
+    print(f"📂 Moved: {state['current_pdf']}")
     return {}
 
 # Build graph
@@ -117,12 +118,10 @@ workflow.add_node("move_file", move_file_node)
 workflow.set_entry_point("scan_files")
 
 # Define edges
-workflow.add_edge("scan_files", "process_next_pdf")
-
 def continue_or_end(state: AppState):
     if state["current_pdf"] is None:
         return END
-    return "classify_document"
+    return "classify_document"  # ← FIXED: Return "classify_document", not "process_next_pdf"
 
 workflow.add_conditional_edges(
     "process_next_pdf",

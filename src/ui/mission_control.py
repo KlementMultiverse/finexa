@@ -1,155 +1,198 @@
 import gradio as gr
-import pandas as pd
+import sqlite3
+import json
 import plotly.express as px
-from src.core.database import FinexaDatabase, FinexaTransaction
+import plotly.graph_objects as go
+import pandas as pd
+from datetime import datetime, timedelta
+import sys
+import os
+
+# Add the parent directory to the path so we can import from src
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from src.core.config import config
-from openai import OpenAI
 
-# Initialize DB and LLM
-db = FinexaDatabase(config.DB_URL)
-client = OpenAI(api_key=config.DASHSCOPE_API_KEY, base_url=config.BASE_URL)
-
-def load_transactions():
-    """Load all transactions for table display."""
-    from sqlalchemy.orm import sessionmaker
-    Session = sessionmaker(bind=db.engine)
-    session = Session()
-    transactions = session.query(FinexaTransaction).order_by(FinexaTransaction.transaction_date, FinexaTransaction.id).all()
+class MissionControlDashboard:
+    def __init__(self):
+        self.db_path = config.DB_PATH
     
-    data = []
-    for tx in transactions:
-        data.append({
-            "ID": tx.id,
-            "Date": tx.transaction_date,
-            "Amount": tx.amount,
-            "Merchant": tx.merchant_name,
-            "Type": tx.document_type,
-            "Linked to": tx.linked_id or "—",
-            "Src": tx.source_path
-        })
-    session.close()
-    return pd.DataFrame(data)
-
-def create_amount_chart():
-    """Create bar chart of transaction amounts."""
-    from sqlalchemy.orm import sessionmaker
-    Session = sessionmaker(bind=db.engine)
-    session = Session()
-    transactions = session.query(FinexaTransaction).order_by(FinexaTransaction.amount.desc()).limit(10).all()
-    session.close()
+    def get_database_stats(self):
+        """Get basic statistics from the database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Total transactions
+            cursor.execute("SELECT COUNT(*) FROM mission_transactions")
+            total_transactions = cursor.fetchone()[0]
+            
+            # Total amount
+            cursor.execute("SELECT SUM(amount) FROM mission_transactions")
+            total_amount = cursor.fetchone()[0] or 0
+            
+            # Unique merchants
+            cursor.execute("SELECT COUNT(DISTINCT merchant_name) FROM mission_transactions")
+            unique_merchants = cursor.fetchone()[0]
+            
+            # Document types
+            cursor.execute("SELECT document_type, COUNT(*) FROM mission_transactions GROUP BY document_type")
+            doc_types = cursor.fetchall()
+            
+            conn.close()
+            
+            return {
+                "total_transactions": total_transactions,
+                "total_amount": total_amount,
+                "unique_merchants": unique_merchants,
+                "document_types": doc_types
+            }
+        except Exception as e:
+            return {"error": str(e)}
     
-    df = pd.DataFrame([
-        {"Merchant": tx.merchant_name, "Amount": tx.amount, "Date": tx.transaction_date}
-        for tx in transactions
-    ])
+    def get_transactions_data(self):
+        """Get all transactions for visualization"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            df = pd.read_sql_query("""
+                SELECT 
+                    id,
+                    transaction_date,
+                    amount,
+                    merchant_name,
+                    document_type,
+                    batch_id,
+                    created_at
+                FROM mission_transactions
+                ORDER BY transaction_date DESC
+            """, conn)
+            conn.close()
+            return df
+        except Exception as e:
+            return pd.DataFrame()
     
-    fig = px.bar(df, x="Merchant", y="Amount", title="💰 Top 10 Transactions by Amount")
-    return fig
-
-def create_category_pie_chart():
-    """Create pie chart of transaction categories."""
-    from sqlalchemy.orm import sessionmaker
-    Session = sessionmaker(bind=db.engine)
-    session = Session()
-    groups = session.query(FinexaTransaction.merchant_name, FinexaTransaction.amount)\
-        .group_by(FinexaTransaction.merchant_name)\
-        .order_by(FinexaTransaction.amount.desc())\
-        .limit(5)\
-        .all()
-    session.close()
-    
-    df = pd.DataFrame(groups, columns=["merchant_name", "amount"])
-    df.columns = ["Merchant", "Amount"]
-    
-    fig = px.pie(df, values="Amount", names="Merchant", title="🥧 Top 5 Merchants")
-    return fig
-
-def chat_with_data(question: str):
-    """Chat with financial data using Qwen-Max."""
-    from sqlalchemy.orm import sessionmaker
-    Session = sessionmaker(bind=db.engine)
-    session = Session()
-    transactions = session.query(FinexaTransaction).order_by(FinexaTransaction.created_at.desc()).limit(20).all()
-    session.close()
-    
-    context = "\n".join([
-        f"ID:{tx.id} | {tx.transaction_date} | ${tx.amount} | {tx.merchant_name} | {tx.document_type}"
-        for tx in transactions
-    ])
-    
-    prompt = f"""
-    You are FINEXA, NASA-grade financial AI assistant.
-    Answer the user's question based on the last 20 transactions.
-
-    Transactions:
-    {context}
-
-    Question: {question}
-
-    Answer concisely in 1-2 sentences.
-    """
-    
-    try:
-        response = client.chat.completions.create(
-            model=config.MODEL_MAX,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-def get_linkage_report():
-    """Generate linkage report."""
-    from sqlalchemy.orm import sessionmaker
-    Session = sessionmaker(bind=db.engine)
-    session = Session()
-    total = session.query(FinexaTransaction).count()
-    linked = session.query(FinexaTransaction).filter(FinexaTransaction.linked_id.isnot(None)).count()
-    unlinked = total - linked
-    session.close()
-    
-    if total > 0:
-        return f"""
-        📊 **FINEXA LINKAGE REPORT**
-        - Total Transactions: {total}
-        - Linked Pairs: {linked}
-        - Unlinked: {unlinked}
-        - Linkage Rate: {linked/total*100:.1f}%
-        """
-    else:
-        return "📊 **FINEXA LINKAGE REPORT**\n- No transactions yet."
-
-# Build UI
-with gr.Blocks(title="FINEXA Mission Control") as demo:
-    gr.Markdown("# 🚀 FINEXA: NASA-GRADE FINANCIAL MISSION CONTROL")
-    
-    with gr.Tab("Transaction Explorer"):
-        gr.Markdown("## 📋 All Transactions (Chronological Order)")
-        df = load_transactions()
-        gr.DataFrame(df, interactive=False)
-    
-    with gr.Tab("AI Chat"):
-        gr.Markdown("## 💬 Chat with Your Financial Data")
-        chat_input = gr.Textbox(label="Ask a question", placeholder="e.g., What was my largest expense last week?")
-        chat_output = gr.Textbox(label="FINEXA Response")
-        chat_btn = gr.Button("Ask FINEXA")
-        chat_btn.click(chat_with_data, inputs=chat_input, outputs=chat_output)
+    def create_spending_chart(self):
+        """Create spending over time chart"""
+        df = self.get_transactions_data()
+        if df.empty:
+            fig = go.Figure()
+            fig.add_annotation(text="No data available", 
+                             xref="paper", yref="paper",
+                             x=0.5, y=0.5, showarrow=False)
+            return fig
         
-        # Add charts
-        gr.Markdown("## 📈 Top 10 Transactions by Amount")
-        amount_chart = gr.Plot(create_amount_chart())  # ← FIXED: gr.Plot, not gr.Plotly
+        # Convert date column
+        df['transaction_date'] = pd.to_datetime(df['transaction_date'])
         
-        gr.Markdown("## 🥧 Top 5 Merchants")
-        category_chart = gr.Plot(create_category_pie_chart())  # ← FIXED: gr.Plot
+        # Group by date and sum amounts
+        daily_spending = df.groupby('transaction_date')['amount'].sum().reset_index()
+        
+        fig = px.line(daily_spending, 
+                     x='transaction_date', 
+                     y='amount',
+                     title='Daily Spending Over Time',
+                     labels={'amount': 'Amount ($)', 'transaction_date': 'Date'})
+        
+        return fig
     
-    with gr.Tab("Linkage Report"):
-        gr.Markdown("## 📊 Financial Nexus Status")
-        report = get_linkage_report()
-        gr.Markdown(report)
-        refresh_btn = gr.Button("Refresh Report")
-        refresh_btn.click(get_linkage_report, inputs=None, outputs=gr.Markdown())
+    def create_merchant_chart(self):
+        """Create top merchants chart"""
+        df = self.get_transactions_data()
+        if df.empty:
+            fig = go.Figure()
+            fig.add_annotation(text="No data available", 
+                             xref="paper", yref="paper",
+                             x=0.5, y=0.5, showarrow=False)
+            return fig
+        
+        # Group by merchant and sum amounts (absolute values for visualization)
+        merchant_spending = df.groupby('merchant_name')['amount'].sum().abs().sort_values(ascending=False).head(10)
+        
+        fig = px.bar(x=merchant_spending.index, 
+                    y=merchant_spending.values,
+                    title='Top 10 Merchants by Spending',
+                    labels={'x': 'Merchant', 'y': 'Amount ($)'})
+        
+        return fig
+    
+    def create_dashboard_interface(self):
+        """Create the Gradio interface"""
+        
+        def refresh_stats():
+            stats = self.get_database_stats()
+            if "error" in stats:
+                return f"Database Error: {stats['error']}", "", ""
+            
+            summary = f"""
+            📊 **FINEXA Mission Control Dashboard**
+            
+            **Database Statistics:**
+            - Total Transactions: {stats['total_transactions']:,}
+            - Total Amount: ${stats['total_amount']:,.2f}
+            - Unique Merchants: {stats['unique_merchants']:,}
+            
+            **Document Types:**
+            """
+            
+            for doc_type, count in stats['document_types']:
+                summary += f"\n- {doc_type}: {count:,} transactions"
+            
+            return summary
+        
+        def get_transactions_table():
+            df = self.get_transactions_data()
+            if df.empty:
+                return "No transactions found"
+            
+            # Format the dataframe for display
+            df['amount'] = df['amount'].apply(lambda x: f"${x:.2f}")
+            df['transaction_date'] = pd.to_datetime(df['transaction_date']).dt.strftime('%Y-%m-%d')
+            
+            return df[['id', 'transaction_date', 'amount', 'merchant_name', 'document_type']].head(50)
+        
+        with gr.Blocks(title="FINEXA Mission Control") as interface:
+            gr.Markdown("# 🚀 FINEXA Mission Control Dashboard")
+            gr.Markdown("Autonomous Financial Intelligence System")
+            
+            with gr.Row():
+                with gr.Column():
+                    stats_output = gr.Markdown(refresh_stats())
+                    refresh_btn = gr.Button("🔄 Refresh Data")
+                
+                with gr.Column():
+                    spending_chart = gr.Plot(self.create_spending_chart())
+            
+            with gr.Row():
+                merchant_chart = gr.Plot(self.create_merchant_chart())
+            
+            with gr.Row():
+                gr.Markdown("## 📋 Recent Transactions")
+                transactions_table = gr.Dataframe(
+                    get_transactions_table(),
+                    label="Latest 50 Transactions"
+                )
+            
+            # Event handlers
+            refresh_btn.click(
+                fn=lambda: [refresh_stats(), self.create_spending_chart(), self.create_merchant_chart(), get_transactions_table()],
+                outputs=[stats_output, spending_chart, merchant_chart, transactions_table]
+            )
+        
+        return interface
 
-# Launch
+def main():
+    """Launch the mission control dashboard"""
+    dashboard = MissionControlDashboard()
+    interface = dashboard.create_dashboard_interface()
+    
+    print("🚀 Launching FINEXA Mission Control Dashboard...")
+    print(f"📊 Database: {config.DB_PATH}")
+    
+    interface.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False
+    )
+
 if __name__ == "__main__":
-    demo.launch()
+    main()

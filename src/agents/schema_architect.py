@@ -11,8 +11,14 @@ class SchemaArchitectAgent:
             base_url=config.BASE_URL
         )
     
-    def generate_agent_schema(self, raw_text: str, document_type: str) -> dict:
-        """Generate dynamic schema from raw text."""
+    def generate_agent_schema(self, input_data, document_type: str) -> dict:
+        """Generate dynamic schema from raw text or dict — ALWAYS RETURNS DICT."""
+        # Convert dict to string if needed
+        if isinstance(input_data, dict):
+            raw_text = json.dumps(input_data, indent=2)
+        else:
+            raw_text = str(input_data)
+        
         if not raw_text.strip():
             return {"error": "No text to process"}
         
@@ -20,13 +26,13 @@ class SchemaArchitectAgent:
         You are a Financial Schema Architect AI.
 
         Document Type: {document_type}
-        Raw Text:
+        Raw Data:
         {raw_text}
 
-        Extract ALL meaningful fields you can infer — even unconventional ones.
-        Think creatively: time of day, mood, purpose, location, payment friction, loyalty status, etc.
+        Extract ALL meaningful fields — even unconventional ones.
+        Think creatively: time of day, mood, purpose, location, etc.
 
-        Return JSON only. No explanation. No markdown. No extra text.
+        Return JSON only. No explanations.
 
         Example Output:
         {{
@@ -35,9 +41,7 @@ class SchemaArchitectAgent:
             "currency": "USD",
             "merchant": "Starbucks Reserve",
             "time_of_day": "Morning",
-            "purpose_guess": "Commute Fuel",
-            "mood_vibe": "Rushed but Happy",
-            "receipt_confidence": 0.98
+            "purpose_guess": "Commute Fuel"
         }}
         """
         
@@ -50,12 +54,15 @@ class SchemaArchitectAgent:
             
             content = response.choices[0].message.content.strip()
             
-            # Try to parse as JSON
+            # Try to parse as JSON → if fails → return error dict
             try:
-                return json.loads(content)
+                parsed = json.loads(content)
+                if isinstance(parsed, dict):
+                    return parsed
+                else:
+                    return {"error": "Not a JSON object", "raw_output": content}
             except json.JSONDecodeError:
-                # Fallback: return as text
-                return {"raw_output": content, "error": "JSON parse failed"}
+                return {"error": "JSON parse failed", "raw_output": content}
                 
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": str(e), "raw_output": ""}

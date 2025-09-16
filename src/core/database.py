@@ -1,83 +1,94 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, Boolean, JSON, ForeignKey, TIMESTAMP, and_, func
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from datetime import datetime, timedelta
-import uuid
+import sqlite3
+import json
+from datetime import datetime
 from .config import config
 
-Base = declarative_base()
-
-class FinexaTransaction(Base):
-    __tablename__ = 'mission_transactions'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    transaction_date = Column(Date, nullable=False)
-    amount = Column(Float, nullable=False)
-    currency = Column(String(3), default='USD')
-    merchant_name = Column(String, nullable=True)
-    document_type = Column(String(20), nullable=False)
-    source_path = Column(String, nullable=False)
-    raw_text = Column(String, nullable=False)
-    agent_schema = Column(JSON, nullable=False)
-    linked_id = Column(Integer, ForeignKey('mission_transactions.id'), nullable=True)
-    is_matched = Column(Boolean, default=False)
-    batch_id = Column(String, nullable=False)
-    created_at = Column(TIMESTAMP, default=datetime.utcnow)
-    last_linked_at = Column(TIMESTAMP, nullable=True)
-
 class FinexaDatabase:
-    def __init__(self, db_url):
-        self.engine = create_engine(db_url)
-        Base.metadata.create_all(self.engine)
-        Session = sessionmaker(bind=self.engine)
-        self.session = Session()
+    def __init__(self, db_path=None):
+        self.db_path = db_path or config.DB_PATH
+        self.init_db()
+    
+    def init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS mission_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transaction_date DATE NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT DEFAULT 'USD',
+                merchant_name TEXT,
+                document_type TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                raw_text TEXT NOT NULL,
+                agent_schema TEXT NOT NULL,
+                linked_id INTEGER,
+                is_matched BOOLEAN DEFAULT 0,
+                batch_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_linked_at TIMESTAMP
+            )
+        """)
+        conn.commit()
+        conn.close()
     
     def insert_transaction(self, **kwargs):
-        tx = FinexaTransaction(**kwargs)
-        self.session.add(tx)
-        self.session.commit()
-        return tx.id
-    
-    def get_transaction_by_id(self, tx_id: int):
-        return self.session.query(FinexaTransaction).filter_by(id=tx_id).first()
-    
-    def get_unlinked_transactions(self, date, amount, new_tx_id: int, batch_id: str, tolerance=0.05):
-        """Get candidates for linking — exclude self, prefer same batch."""
-        start_date = date - timedelta(days=3)
-        end_date = date + timedelta(days=3)
+        # 🔧 EXPECT agent_schema to already be a JSON string
+        agent_schema = kwargs.get('agent_schema')
+        if not isinstance(agent_schema, str):
+            raise ValueError(f"agent_schema must be JSON string, got {type(agent_schema)}")
         
-        # First, try same batch
-        candidates = self.session.query(FinexaTransaction).filter(
-            FinexaTransaction.id != new_tx_id,
-            FinexaTransaction.linked_id.is_(None),
-            FinexaTransaction.batch_id == batch_id,  # ← SAME BATCH FIRST
-            func.abs(FinexaTransaction.amount - amount) < amount * tolerance,
-            FinexaTransaction.transaction_date.between(start_date, end_date)
-        ).all()
+        print(f"🔧 DB DEBUG: Inserting agent_schema type: {type(agent_schema)}")
+        print(f"🔧 DB DEBUG: agent_schema length: {len(agent_schema)} chars")
         
-        # If no same-batch candidates, try any batch
-        if not candidates:
-            candidates = self.session.query(FinexaTransaction).filter(
-                FinexaTransaction.id != new_tx_id,
-                FinexaTransaction.linked_id.is_(None),
-                func.abs(FinexaTransaction.amount - amount) < amount * tolerance,
-                FinexaTransaction.transaction_date.between(start_date, end_date)
-            ).all()
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO mission_transactions (
+                transaction_date, amount, currency, merchant_name, document_type,
+                source_path, raw_text, agent_schema, linked_id, is_matched,
+                batch_id, created_at, last_linked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            kwargs.get('transaction_date'),
+            kwargs.get('amount'),
+            kwargs.get('currency', 'USD'),
+            kwargs.get('merchant_name'),
+            kwargs.get('document_type'),
+            kwargs.get('source_path'),
+            kwargs.get('raw_text'),
+            agent_schema,  # ← Should be JSON string by now
+            kwargs.get('linked_id'),
+            kwargs.get('is_matched', 0),
+            kwargs.get('batch_id'),
+            kwargs.get('created_at', datetime.utcnow()),
+            kwargs.get('last_linked_at')
+        ))
+        tx_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        print(f"💾 SUCCESS: Inserted transaction ID {tx_id}")
+        return tx_id
+    
+    def get_transaction_by_id(self, tx_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM mission_transactions WHERE id = ?", (tx_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row: 
+            return None
         
-        return candidates
-    
-    def link_transactions(self, id1, id2):
-        """Link two transactions bidirectionally."""
-        tx1 = self.get_transaction_by_id(id1)
-        tx2 = self.get_transaction_by_id(id2)
-        if tx1 and tx2:
-            tx1.linked_id = id2
-            tx2.linked_id = id1
-            tx1.is_matched = True
-            tx2.is_matched = True
-            tx1.last_linked_at = datetime.utcnow()
-            tx2.last_linked_at = datetime.utcnow()
-            self.session.commit()
-    
-    def close(self):
-        self.session.close()
+        columns = ['id', 'transaction_date', 'amount', 'currency', 'merchant_name', 
+                  'document_type', 'source_path', 'raw_text', 'agent_schema', 
+                  'linked_id', 'is_matched', 'batch_id', 'created_at', 'last_linked_at']
+        tx = dict(zip(columns, row))
+        
+        # Convert JSON string back to dict for reading
+        if isinstance(tx['agent_schema'], str):
+            try: 
+                tx['agent_schema'] = json.loads(tx['agent_schema'])
+            except: 
+                tx['agent_schema'] = {"error": "JSON decode failed", "raw": tx['agent_schema']}
+        
+        return tx
